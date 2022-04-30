@@ -38,7 +38,7 @@
             "outputPath": "dist",
             "index": "src/index.html",
             "i18nMissingTranslation": "warning",
-            "localize": ["en"],
+            "localize": false,
             "main": "src/main.ts",
             "polyfills": "src/polyfills.ts",
             "tsConfig": "tsconfig.app.json",
@@ -68,14 +68,8 @@
             "scripts": []
           },
           "configurations": {
-            "de": {
-              "localize": ["de"]
-            },
-            "fr": {
-              "localize": ["fr"]
-            },
             "production": {
-              "localize": ["en", "de", "fr"],
+              "localize": true,
               "fileReplacements": [
                 {
                   "replace": "src/environments/environment.ts",
@@ -119,12 +113,6 @@
             "browserTarget": "OctoDash:build"
           },
           "configurations": {
-            "de": {
-              "browserTarget": "OctoDash:build:de"
-            },
-            "fr": {
-              "browserTarget": "OctoDash:build:fr"
-            },
             "production": {
               "browserTarget": "OctoDash:build:production"
             },
