@@ -1,13 +1,22 @@
-import { HttpClient } from '@angular/common/http';
+import { HttpClient, HttpErrorResponse } from '@angular/common/http';
 import { Injectable } from '@angular/core';
 import _ from 'lodash-es';
-import { Observable, ReplaySubject, Subject } from 'rxjs';
-import { pluck, startWith } from 'rxjs/operators';
+import { Observable, of, ReplaySubject, Subject } from 'rxjs';
+import { catchError, pluck, startWith } from 'rxjs/operators';
 import { webSocket, WebSocketSubject } from 'rxjs/webSocket';
 
 import { ConfigService } from '../../config/config.service';
 import { ConversionService } from '../../conversion.service';
-import { JobStatus, PrinterEvent, PrinterState, PrinterStatus, SocketAuth } from '../../model';
+import {
+  JobStatus,
+  Notification,
+  NotificationType,
+  PrinterEvent,
+  PrinterNotification,
+  PrinterState,
+  PrinterStatus,
+  SocketAuth,
+} from '../../model';
 import {
   DisplayLayerProgressData,
   OctoprintFilament,
@@ -15,6 +24,7 @@ import {
   OctoprintSocketCurrent,
   OctoprintSocketEvent,
 } from '../../model/octoprint';
+import { NotificationService } from '../../notification/notification.service';
 import { SystemService } from '../system/system.service';
 import { SocketService } from './socket.service';
 
@@ -27,6 +37,7 @@ export class OctoPrintSocketService implements SocketService {
   private printerStatusSubject: Subject<PrinterStatus>;
   private jobStatusSubject: Subject<JobStatus>;
   private eventSubject: Subject<PrinterEvent>;
+  private statusTextSubject: Subject<string>;
 
   private printerStatus: PrinterStatus;
   private jobStatus: JobStatus;
@@ -36,11 +47,13 @@ export class OctoPrintSocketService implements SocketService {
     private configService: ConfigService,
     private systemService: SystemService,
     private conversionService: ConversionService,
+    private notificationService: NotificationService,
     private http: HttpClient,
   ) {
-    this.printerStatusSubject = new ReplaySubject<PrinterStatus>();
+    this.printerStatusSubject = new ReplaySubject<PrinterStatus>(1);
     this.jobStatusSubject = new Subject<JobStatus>();
-    this.eventSubject = new ReplaySubject<PrinterEvent>();
+    this.eventSubject = new ReplaySubject<PrinterEvent>(5);
+    this.statusTextSubject = new ReplaySubject<string>(1);
   }
 
   //==== SETUP & AUTH ====//
@@ -70,6 +83,7 @@ export class OctoPrintSocketService implements SocketService {
       },
       fanSpeed: this.configService.isDisplayLayerProgressEnabled() ? 0 : -1,
     } as PrinterStatus;
+    this.printerStatusSubject.next(this.printerStatus);
   }
 
   private initJobStatus(): void {
@@ -90,17 +104,40 @@ export class OctoPrintSocketService implements SocketService {
   }
 
   private tryConnect(resolve: () => void): void {
-    this.systemService.getSessionKey().subscribe(
-      socketAuth => {
-        this.connectSocket();
-        this.setupSocket(resolve);
-        this.authenticateSocket(socketAuth);
+    this.systemService.getSessionKey().subscribe({
+      next: (socketAuth: SocketAuth) => {
+        this.http.get(this.configService.getApiURL('connection'), this.configService.getHTTPHeaders()).subscribe({
+          next: () => {
+            this.connectSocket();
+            this.setupSocket(resolve);
+            this.authenticateSocket(socketAuth);
+          },
+          error: (err: HttpErrorResponse) => {
+            if (err.status === 403) {
+              this.notificationService.setNotification({
+                heading: $localize`:@@http-403-heading:HTTP Error 403 - FORBIDDEN`,
+                text: $localize`:@@http-403-text:This most likely means that your API Key is invalid. Please update the API Key and restart your system.`,
+                type: NotificationType.ERROR,
+                time: new Date(),
+                sticky: true,
+              } as Notification);
+            } else {
+              this.notificationService.setNotification({
+                heading: $localize`:@@http-unknown-heading:Unknown HTTP Error`,
+                text: err.message,
+                type: NotificationType.ERROR,
+                time: new Date(),
+                sticky: true,
+              } as Notification);
+            }
+          },
+        });
       },
-      () => {
+      error: () => {
         setTimeout(this.tryConnect.bind(this), this.fastInterval < 6 ? 5000 : 15000, resolve);
         this.fastInterval += 1;
       },
-    );
+    });
   }
 
   private connectSocket() {
@@ -117,9 +154,28 @@ export class OctoPrintSocketService implements SocketService {
     this.socket.next(payload);
   }
 
+  private handlePluginMessage(pluginMessage: OctoprintPluginMessage) {
+    const plugins = [
+      {
+        check: (plugin: string) =>
+          plugin === 'DisplayLayerProgress-websocket-payload' && this.configService.isDisplayLayerProgressEnabled(),
+        handler: (message: unknown) => {
+          this.extractFanSpeed(message as DisplayLayerProgressData);
+          this.extractLayerHeight(message as DisplayLayerProgressData);
+        },
+      },
+      {
+        check: (plugin: string) => ['action_command_prompt', 'action_command_notification'].includes(plugin),
+        handler: (message: unknown) => this.handlePrinterNotification(message as PrinterNotification),
+      },
+    ];
+
+    plugins.forEach(plugin => plugin.check(pluginMessage.plugin.plugin) && plugin.handler(pluginMessage.plugin.data));
+  }
+
   private setupSocket(resolve: () => void) {
-    this.socket.subscribe(
-      message => {
+    this.socket.subscribe({
+      next: message => {
         clearTimeout(this.socketDeadTimeout);
         this.socketDeadTimeout = setTimeout(() => {
           this.printerStatus.status = PrinterState.socketDead;
@@ -131,14 +187,7 @@ export class OctoPrintSocketService implements SocketService {
         } else if (Object.hasOwnProperty.bind(message)('event')) {
           this.extractPrinterEvent(message as OctoprintSocketEvent);
         } else if (Object.hasOwnProperty.bind(message)('plugin')) {
-          const pluginMessage = message as OctoprintPluginMessage;
-          if (
-            pluginMessage.plugin.plugin === 'DisplayLayerProgress-websocket-payload' &&
-            this.configService.isDisplayLayerProgressEnabled()
-          ) {
-            this.extractFanSpeed(pluginMessage.plugin.data as DisplayLayerProgressData);
-            this.extractLayerHeight(pluginMessage.plugin.data as DisplayLayerProgressData);
-          }
+          this.handlePluginMessage(message as OctoprintPluginMessage);
         } else if (Object.hasOwnProperty.bind(message)('reauthRequired')) {
           this.systemService.getSessionKey().subscribe(socketAuth => this.authenticateSocket(socketAuth));
         } else if (Object.hasOwnProperty.bind(message)('connected')) {
@@ -146,7 +195,7 @@ export class OctoPrintSocketService implements SocketService {
           this.checkPrinterConnection();
         }
       },
-      error => {
+      error: error => {
         if (error['type'] === 'close') {
           this.printerStatus.status = PrinterState.reconnecting;
           this.printerStatusSubject.next(this.printerStatus);
@@ -155,7 +204,7 @@ export class OctoPrintSocketService implements SocketService {
           console.error(error);
         }
       },
-    );
+    });
   }
 
   private checkPrinterConnection() {
@@ -186,14 +235,14 @@ export class OctoPrintSocketService implements SocketService {
     }
     this.printerStatus.status = PrinterState[message.current.state.text.toLowerCase()];
 
-    if (this.printerStatus.status === PrinterState.printing && this.lastState === PrinterEvent.UNKNOWN) {
+    if (this.printerStatus.status === PrinterState.printing && this.lastState !== PrinterEvent.PRINTING) {
       this.extractPrinterEvent({
         event: {
           type: 'PrintStarted',
           payload: null,
         },
       } as OctoprintSocketEvent);
-    } else if (this.printerStatus.status === PrinterState.paused && this.lastState === PrinterEvent.UNKNOWN) {
+    } else if (this.printerStatus.status === PrinterState.paused && this.lastState !== PrinterEvent.PAUSED) {
       this.extractPrinterEvent({
         event: {
           type: 'PrintPaused',
@@ -299,6 +348,15 @@ export class OctoPrintSocketService implements SocketService {
         break;
       case 'Error':
         newState = PrinterEvent.CLOSED;
+        if (state.event.payload) {
+          this.notificationService.setNotification({
+            heading: $localize`:@@printer-error:Printer error`,
+            text: state.event.payload.error,
+            type: NotificationType.ERROR,
+            time: new Date(),
+            sticky: true,
+          } as Notification);
+        }
         break;
       default:
         break;
@@ -308,6 +366,50 @@ export class OctoPrintSocketService implements SocketService {
       this.lastState = newState;
       this.eventSubject.next(newState);
     }
+  }
+
+  //==== Notifications ====//
+
+  private handlePrinterNotification(notification: PrinterNotification) {
+    if (Object.keys(notification).length > 0) {
+      if (notification.action === 'close') {
+        this.notificationService.closeNotification();
+      } else if (notification.choices?.length > 0) {
+        this.notificationService.setNotification({
+          heading: $localize`:@@action-required:Action required`,
+          text: notification.text ?? notification.message,
+          type: NotificationType.PROMPT,
+          time: new Date(),
+          choices: notification.choices,
+          callback: this.callbackFunction.bind(this),
+          sticky: true,
+        } as Notification);
+      } else if (notification.text || notification.message) {
+        console.log(notification.text ?? notification.message);
+        this.statusTextSubject.next(notification.text ?? notification.message);
+      }
+    }
+  }
+
+  private callbackFunction(index: number) {
+    this.http
+      .post(
+        this.configService.getApiURL('plugin/action_command_prompt'),
+        { command: 'select', choice: index },
+        this.configService.getHTTPHeaders(),
+      )
+      .pipe(
+        catchError(error => {
+          this.notificationService.setNotification({
+            heading: $localize`:@@error-answer-prompt:Can't answer prompt!`,
+            text: error.message,
+            type: NotificationType.ERROR,
+            time: new Date(),
+          });
+          return of(null);
+        }),
+      )
+      .subscribe();
   }
 
   //==== Subscribables ====//
@@ -322,5 +424,9 @@ export class OctoPrintSocketService implements SocketService {
 
   public getEventSubscribable(): Observable<PrinterEvent> {
     return this.eventSubject;
+  }
+
+  public getPrinterStatusText(): Observable<string> {
+    return this.statusTextSubject;
   }
 }
