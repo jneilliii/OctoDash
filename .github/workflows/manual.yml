@@ -26,8 +26,6 @@ jobs:
         uses: actions/setup-node@v1
         with:
           node-version: '14'
-      - name: Installing Dependencies
-        run: npm ci
       - name: Building Application
         run: npm run ng:build
       - name: Packaging Application
