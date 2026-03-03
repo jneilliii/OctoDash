@@ -34,6 +34,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
       - name: Upload Artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           path: package/octodash*.deb
